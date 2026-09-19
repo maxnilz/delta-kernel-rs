@@ -36,7 +36,7 @@ use crate::scan::EngineSchema;
 use crate::schema_visitor::{extract_kernel_schema, KernelSchemaVisitorState};
 use crate::{
     unwrap_and_parse_path_as_url, DeltaResult, ExclusiveEngineData, ExternEngine,
-    KernelStringSlice, OptionalValue, SharedExternEngine, SharedSnapshot, Snapshot,
+    KernelStringSlice, OptionalValue, SharedExternEngine, SharedSchema, SharedSnapshot, Snapshot,
     TryFromStringSlice, Url,
 };
 
@@ -158,6 +158,50 @@ fn commit_result_to_committed_handle<S>(
 #[no_mangle]
 pub unsafe extern "C" fn free_transaction(txn: Handle<ExclusiveTransaction>) {
     txn.drop_handle();
+}
+
+/// Get a committer that writes commits directly to the table's `_delta_log` on the filesystem.
+///
+/// Pass the result to [`transaction_with_committer`] to start a transaction from a snapshot the
+/// engine already holds, rather than from the latest version as [`transaction`] does. The returned
+/// handle is normally consumed there; free it with [`free_file_system_committer`] only on a path
+/// that does not reach that call. It is consumed even when that call returns an error.
+#[no_mangle]
+pub extern "C" fn get_file_system_committer() -> Handle<MutableCommitter> {
+    let committer: Box<dyn Committer> = Box::new(FileSystemCommitter::new());
+    committer.into()
+}
+
+/// Free a committer obtained via [`get_file_system_committer`]. Warning! Normally the value
+/// returned there is consumed when creating a transaction via [`transaction_with_committer`] and
+/// will NOT need to be freed.
+///
+/// # Safety
+///
+/// Caller is responsible for passing a valid handle obtained via `get_file_system_committer`.
+#[no_mangle]
+pub unsafe extern "C" fn free_file_system_committer(committer: Handle<MutableCommitter>) {
+    committer.drop_handle();
+}
+
+/// Read the physical statistics schema without consuming the transaction.
+///
+/// The returned schema must be freed via [`crate::free_schema`].
+///
+/// # Safety
+///
+/// Caller is responsible for passing valid handles. Does not consume the transaction handle; the
+/// caller still owns it.
+#[no_mangle]
+pub unsafe extern "C" fn transaction_stats_schema(
+    txn: Handle<ExclusiveTransaction>,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<SharedSchema>> {
+    let txn = unsafe { txn.as_ref() };
+    let engine = unsafe { engine.as_ref() };
+    txn.stats_schema()
+        .map(Into::into)
+        .into_extern_result(&engine)
 }
 
 /// Attaches engine info to an existing-table transaction.
@@ -3209,6 +3253,53 @@ mod tests {
         // a non-empty SV triggers a different code path in generate_remove_actions that
         // requires additional scan row fields not present in this test setup.
         unsafe { free_transaction(txn) };
+        unsafe { free_engine(engine) };
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_transaction_stats_schema_preserves_transaction(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (store, _test_engine, table_url) =
+            test_utils::engine_store_setup("test_transaction_stats_schema", None);
+        // create_table_with_one_file commits the table at version 0 and one add action at version
+        // 1.
+        let (table_path, engine) = create_table_with_one_file(&store, &table_url).await?;
+        let table_path_str = table_path.as_str();
+
+        let snapshot =
+            unsafe { build_snapshot(kernel_string_slice!(table_path_str), engine.shallow_copy()) };
+
+        let committer = get_file_system_committer();
+        // transaction_with_committer clones the snapshot's Arc rather than taking the handle, so
+        // the handle is still this test's to free.
+        let txn = ok_or_panic(unsafe {
+            transaction_with_committer(snapshot.shallow_copy(), engine.shallow_copy(), committer)
+        });
+        let engine_info = "duckdelta-test";
+        let txn = ok_or_panic(unsafe {
+            with_engine_info(
+                txn,
+                kernel_string_slice!(engine_info),
+                engine.shallow_copy(),
+            )
+        });
+
+        // The FFI reader must return the same schema as Transaction::stats_schema.
+        let stats = ok_or_panic(unsafe {
+            transaction_stats_schema(txn.shallow_copy(), engine.shallow_copy())
+        });
+        let expected = unsafe { txn.as_ref() }.stats_schema()?;
+        assert_eq!(unsafe { stats.as_ref() }, expected.as_ref());
+        unsafe { free_schema(stats) };
+
+        // set_data_change and commit use the same transaction after the schema call, proving the
+        // schema reader borrowed it rather than consuming it.
+        unsafe { set_data_change(txn.shallow_copy(), false) };
+        let committed = ok_or_panic(unsafe { commit(txn, engine.shallow_copy()) });
+        assert_eq!(unsafe { version_and_free(committed) }, 2);
+
+        unsafe { free_snapshot(snapshot) };
         unsafe { free_engine(engine) };
         Ok(())
     }
