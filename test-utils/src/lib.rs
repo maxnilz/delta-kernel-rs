@@ -172,8 +172,8 @@ use delta_kernel::actions::{
     LOG_ADD_SCHEMA, MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS, TIGHT_BOUNDS,
 };
 use delta_kernel::arrow::array::{
-    Array, ArrayRef, AsArray, BooleanArray, Float64Array, Int32Array, Int64Array, MapArray,
-    MapBuilder, RecordBatch, StringArray, StringBuilder, StructArray,
+    new_null_array, Array, ArrayRef, AsArray, BooleanArray, Float64Array, Int32Array, Int64Array,
+    MapArray, MapBuilder, RecordBatch, StringArray, StringBuilder, StructArray,
 };
 use delta_kernel::arrow::buffer::OffsetBuffer;
 use delta_kernel::arrow::compute::concat;
@@ -1497,14 +1497,22 @@ pub fn create_add_files_metadata(
         ),
     ]);
 
+    let arrow_schema: ArrowSchema = TryFromKernel::try_from_kernel(add_files_schema.as_ref())?;
+
+    // The batch must match the schema it is built from, field for field. No test here stages a
+    // deletion vector, so the column is null for every row.
+    let deletion_vector_field = arrow_schema.field_with_name("deletionVector")?;
+    let deletion_vector_array = new_null_array(deletion_vector_field.data_type(), num_files);
+
     let batch = RecordBatch::try_new(
-        Arc::new(TryFromKernel::try_from_kernel(add_files_schema.as_ref())?),
+        Arc::new(arrow_schema),
         vec![
             Arc::new(path_array) as ArrayRef,
             partition_values_array as ArrayRef,
             Arc::new(size_array) as ArrayRef,
             Arc::new(mod_time_array) as ArrayRef,
             Arc::new(stats_struct) as ArrayRef,
+            deletion_vector_array,
         ],
     )?;
 

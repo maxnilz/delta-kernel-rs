@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use delta_kernel_derive::internal_api;
 use tracing::instrument;
 
+use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::actions::{
     as_log_add_schema, CommitInfo, DomainMetadata, Metadata, Protocol, SetTransaction,
     LOG_METADATA_SCHEMA, LOG_PROTOCOL_SCHEMA, LOG_REMOVE_SCHEMA, LOG_TXN_SCHEMA, MAX_VALUES,
@@ -39,7 +40,7 @@ use crate::scan::scan_row_schema;
 use crate::schema::void_utils::validate_schema_for_write;
 use crate::schema::{
     lazy_schema_ref, schema_ref, ArrayType, ColumnDefault, SchemaRef, SchemaStructPatchBuilder,
-    StructField, StructType,
+    StructField, StructType, ToSchema as _,
 };
 use crate::snapshot::{Snapshot, SnapshotRef};
 use crate::struct_patch::ProjectionStructPatchBuilder;
@@ -129,6 +130,10 @@ pub(crate) static BASE_ADD_FILES_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! 
         nullable MAX_VALUES: {},
         nullable TIGHT_BOUNDS: BOOLEAN,
     },
+    // A connector that deletes rows from a file it is adding in this same commit puts the
+    // vector in this field. The protocol allows an add with a vector and no matching remove,
+    // because a path nothing has named yet has no earlier logical file to retire.
+    nullable "deletionVector": (DeletionVectorDescriptor::to_schema()),
 };
 
 static DATA_CHANGE_COLUMN: LazyLock<StructField> =
@@ -1909,6 +1914,7 @@ mod tests {
                 nullable MAX_VALUES: {},
                 nullable TIGHT_BOUNDS: BOOLEAN,
             },
+            nullable "deletionVector": (DeletionVectorDescriptor::to_schema()),
         };
         assert_eq!(*schema, expected.into());
         Ok(())
@@ -1933,6 +1939,7 @@ mod tests {
                 "modificationTime",
                 "dataChange",
                 "stats",
+                "deletionVector",
                 "baseRowId",
                 "defaultRowCommitVersion",
             ]
@@ -1944,6 +1951,7 @@ mod tests {
                 "modificationTime",
                 "dataChange",
                 "stats",
+                "deletionVector",
             ]
         };
         assert_eq!(field_names, expected_field_names);

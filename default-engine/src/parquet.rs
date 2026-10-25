@@ -5,8 +5,11 @@ use std::num::NonZero;
 use std::ops::Range;
 use std::sync::Arc;
 
+use delta_kernel::actions::deletion_vector::DeletionVectorDescriptor;
 use delta_kernel::arrow::array::builder::{MapBuilder, MapFieldNames, StringBuilder};
-use delta_kernel::arrow::array::{Array, Int64Array, RecordBatch, StringArray, StructArray};
+use delta_kernel::arrow::array::{
+    new_null_array, Array, Int64Array, RecordBatch, StringArray, StructArray,
+};
 use delta_kernel::arrow::datatypes::{DataType, Field, Schema};
 use delta_kernel::engine::arrow_conversion::{TryFromArrow as _, TryIntoArrow as _};
 use delta_kernel::engine::arrow_data::ArrowEngineData;
@@ -26,7 +29,7 @@ use delta_kernel::parquet::arrow::async_reader::{
     ParquetObjectReader, ParquetRecordBatchStreamBuilder,
 };
 use delta_kernel::parquet::arrow::async_writer::{AsyncArrowWriter, ParquetObjectWriter};
-use delta_kernel::schema::{SchemaRef, StructType};
+use delta_kernel::schema::{SchemaRef, StructType, ToSchema as _};
 use delta_kernel::transaction::BoundWriteContext;
 use delta_kernel::{
     CancellationTokenRef, DeltaResult, DeltaResultIteratorStatic, EngineData, Error,
@@ -118,6 +121,13 @@ impl DataFileMetadata {
 
         let stats_array = Arc::new(self.stats.clone());
 
+        // The batch must match the add files schema field for field. A file written here has no
+        // deletion vector, so the column is null.
+        let deletion_vector_schema: Schema =
+            (&DeletionVectorDescriptor::to_schema()).try_into_arrow()?;
+        let deletion_vector_type = DataType::Struct(deletion_vector_schema.fields().clone());
+        let deletion_vector = new_null_array(&deletion_vector_type, 1);
+
         // Build schema dynamically based on stats (stats schema varies based on collected
         // statistics)
         let key_value_struct = DataType::Struct(
@@ -140,11 +150,19 @@ impl DataFileMetadata {
             Field::new("size", DataType::Int64, false),
             Field::new("modificationTime", DataType::Int64, false),
             Field::new("stats", stats_array.data_type().clone(), true),
+            Field::new("deletionVector", deletion_vector_type, true),
         ]);
 
         Ok(Box::new(ArrowEngineData::new(RecordBatch::try_new(
             Arc::new(schema),
-            vec![path, partitions, size, modification_time, stats_array],
+            vec![
+                path,
+                partitions,
+                size,
+                modification_time,
+                stats_array,
+                deletion_vector,
+            ],
         )?)))
     }
 }
@@ -1005,6 +1023,17 @@ mod tests {
         partition_values_builder.append(true).unwrap();
         let partition_values = partition_values_builder.finish();
 
+        let deletion_vector_type = ArrowDataType::Struct(
+            vec![
+                Field::new("storageType", ArrowDataType::Utf8, false),
+                Field::new("pathOrInlineDv", ArrowDataType::Utf8, false),
+                Field::new("offset", ArrowDataType::Int32, true),
+                Field::new("sizeInBytes", ArrowDataType::Int32, false),
+                Field::new("cardinality", ArrowDataType::Int64, false),
+            ]
+            .into(),
+        );
+
         // Build expected schema dynamically based on stats
         let stats_field = Field::new("stats", stats.data_type().clone(), true);
         let schema = Arc::new(delta_kernel::arrow::datatypes::Schema::new(vec![
@@ -1030,6 +1059,7 @@ mod tests {
             Field::new("size", ArrowDataType::Int64, false),
             Field::new("modificationTime", ArrowDataType::Int64, false),
             stats_field,
+            Field::new("deletionVector", deletion_vector_type.clone(), true),
         ]));
 
         let expected = RecordBatch::try_new(
@@ -1040,6 +1070,7 @@ mod tests {
                 Arc::new(Int64Array::from(vec![size as i64])),
                 Arc::new(Int64Array::from(vec![last_modified])),
                 Arc::new(stats),
+                new_null_array(&deletion_vector_type, 1),
             ],
         )
         .unwrap();
